@@ -1,0 +1,11 @@
+node_modules/
+dist/
+kimi_profile/
+.env
+.env.local
+*.log
+.DS_Store
+coverage/
+.cache/
+.kilo
+
