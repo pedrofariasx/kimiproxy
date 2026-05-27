@@ -23,6 +23,10 @@ export function getSession(sessionId: string): SessionData | undefined {
   return sessions.get(sessionId);
 }
 
+export function clearSession(sessionId: string): void {
+  sessions.delete(sessionId);
+}
+
 // Mapeia modelos recebidos do front para os cenários internos da Kimi
 export function getModelScenario(modelId: string) {
   const cleanModel = modelId.replace('-no-thinking', '');

@@ -8,7 +8,7 @@
 import { Context } from 'hono';
 import { stream as honoStream } from 'hono/streaming';
 import { v4 as uuidv4 } from 'uuid';
-import { createKimiStream, updateSession, getSession } from '../services/kimi.ts';
+import { createKimiStream, updateSession, getSession, clearSession } from '../services/kimi.ts';
 import { OpenAIRequest } from '../utils/types.ts';
 import { StreamingToolParser } from '../tools/parser.ts';
 
@@ -179,6 +179,17 @@ export async function chatCompletions(c: Context) {
     
     const sessionAffinity = c.req.header('x-session-affinity') || null;
     const hasCachedSession = !!(sessionAffinity && getSession(sessionAffinity));
+    
+    // Check for system prompt presence (used by OpenCode compact/reset)
+    const hasSystemPrompt = (body.messages || []).some(m => m.role === 'system');
+    
+    // Compact detection: start fresh chat when system prompt appears on a cached session
+    if (hasCachedSession && hasSystemPrompt) {
+      console.log(`[Session] System prompt detected — clearing session ${sessionAffinity} for compact`);
+      clearSession(sessionAffinity);
+    }
+    
+    const effectiveCachedSession = !!(sessionAffinity && getSession(sessionAffinity));
 
     // Build prompt
     let prompt = '';
