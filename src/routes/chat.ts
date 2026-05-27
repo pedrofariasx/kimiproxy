@@ -8,7 +8,7 @@
 import { Context } from 'hono';
 import { stream as honoStream } from 'hono/streaming';
 import { v4 as uuidv4 } from 'uuid';
-import { createKimiStream, updateSessionParent } from '../services/kimi.ts';
+import { createKimiStream, updateSession, getSession, clearSession } from '../services/kimi.ts';
 import { OpenAIRequest } from '../utils/types.ts';
 import { StreamingToolParser } from '../tools/parser.ts';
 
@@ -88,12 +88,14 @@ interface StreamConsumptionResult {
   toolCallsOut: any[];
   assistantMessageId: string;
   uiSessionId: string;
+  sessionAffinity: string | null;
 }
 
 async function consumeKimiStream(
   stream: ReadableStream,
   toolParser: StreamingToolParser,
-  initialUiSessionId: string
+  initialUiSessionId: string,
+  sessionAffinity: string | null
 ): Promise<StreamConsumptionResult> {
   const reader = stream.getReader();
   const parser = new ConnectStreamParser();
@@ -116,7 +118,10 @@ async function consumeKimiStream(
       if (msg.op === 'set' && msg.mask === 'message' && msg.message) {
         if (msg.message.role === 'assistant' && msg.message.id) {
           assistantMessageId = msg.message.id;
-          updateSessionParent(uiSessionId, assistantMessageId);
+          // OpenCode: save session using x-session-affinity as key
+          if (sessionAffinity) {
+            updateSession(sessionAffinity, uiSessionId, assistantMessageId);
+          }
         }
       }
 
@@ -162,7 +167,8 @@ async function consumeKimiStream(
     reasoningBuffer,
     toolCallsOut,
     assistantMessageId,
-    uiSessionId
+    uiSessionId,
+    sessionAffinity
   };
 }
 
@@ -171,72 +177,102 @@ export async function chatCompletions(c: Context) {
     const body: OpenAIRequest = await c.req.json();
     const isStream = body.stream ?? false;
     
-    // Extract the prompt
+    const sessionAffinity = c.req.header('x-session-affinity') || null;
+    const hasCachedSession = !!(sessionAffinity && getSession(sessionAffinity));
+    
+    // Check for system prompt presence (used by OpenCode compact/reset)
+    const hasSystemPrompt = (body.messages || []).some(m => m.role === 'system');
+    
+    // Compact detection: start fresh chat when system prompt appears on a cached session
+    if (hasCachedSession && hasSystemPrompt) {
+      console.log(`[Session] System prompt detected — clearing session ${sessionAffinity} for compact`);
+      clearSession(sessionAffinity);
+    }
+    
+    const effectiveCachedSession = !!(sessionAffinity && getSession(sessionAffinity));
+
+    // Build prompt
     let prompt = '';
     const messages = body.messages || [];
     let systemPrompt = '';
     
-    for (let i = 0; i < messages.length; i++) {
-      const msg = messages[i];
-      let contentStr = '';
-      if (Array.isArray(msg.content)) {
-        contentStr = msg.content.map((c: any) => c.text || JSON.stringify(c)).join('\n');
-      } else if (typeof msg.content === 'object' && msg.content !== null) {
-        contentStr = JSON.stringify(msg.content);
-      } else {
-        contentStr = msg.content || '';
+    if (hasCachedSession) {
+      // OpenCode: session already exists on Kimi — send only the last user message
+      for (let i = messages.length - 1; i >= 0; i--) {
+        if (messages[i].role === 'user') {
+          let contentStr = '';
+          const content = messages[i].content;
+          if (Array.isArray(content)) {
+            contentStr = (content as any[]).map((c: any) => c.text || JSON.stringify(c)).join('\n');
+          } else if (typeof content === 'string') {
+            contentStr = content;
+          }
+          prompt = contentStr;
+          break;
+        }
+      }
+    } else {
+      // New session: build full conversation as text prompt
+      for (let i = 0; i < messages.length; i++) {
+        const msg = messages[i];
+        let contentStr = '';
+        if (Array.isArray(msg.content)) {
+          contentStr = msg.content.map((c: any) => c.text || JSON.stringify(c)).join('\n');
+        } else if (typeof msg.content === 'object' && msg.content !== null) {
+          contentStr = JSON.stringify(msg.content);
+        } else {
+          contentStr = msg.content || '';
+        }
+
+        if (msg.role === 'system') {
+          systemPrompt += contentStr + '\n\n';
+        } else if (msg.role === 'user') {
+          prompt += `User: ${contentStr}\n\n`;
+        } else if (msg.role === 'assistant') {
+          let assistantContent = contentStr;
+          if ((msg as any).reasoning_content) {
+            assistantContent = `<think>\n${(msg as any).reasoning_content}\n</think>\n${assistantContent}`;
+          }
+          if (msg.tool_calls && Array.isArray(msg.tool_calls)) {
+             for (const tc of msg.tool_calls) {
+                let args = tc.function?.arguments || '{}';
+                if (typeof args !== 'string') args = JSON.stringify(args);
+                assistantContent += `\n<tool_call>{"name": "${tc.function?.name}", "arguments": ${args}}</tool_call>`;
+             }
+          }
+          prompt += `Assistant: ${assistantContent.trim()}\n\n`;
+        } else if (msg.role === 'tool' || msg.role === 'function') {
+          prompt += `Tool Response (${msg.name || 'tool'}): ${contentStr}\n\n`;
+        }
       }
 
-      if (msg.role === 'system') {
-        systemPrompt += contentStr + '\n\n';
-      } else if (msg.role === 'user') {
-        prompt += `User: ${contentStr}\n\n`;
-      } else if (msg.role === 'assistant') {
-        let assistantContent = contentStr;
-        if ((msg as any).reasoning_content) {
-          assistantContent = `<think>\n${(msg as any).reasoning_content}\n</think>\n${assistantContent}`;
+      // Inject tools instructions (only for new sessions)
+      const bodyAny = body as any;
+      if (bodyAny.tools && Array.isArray(bodyAny.tools) && bodyAny.tools.length > 0) {
+        const formattedTools = bodyAny.tools.map((t: any) => {
+          if (t.type === 'function') {
+            return {
+              name: t.function.name,
+              description: t.function.description || '',
+              parameters: t.function.parameters
+            };
+          }
+          return t;
+        });
+        const toolsJson = JSON.stringify(formattedTools, null, 2);
+        
+        systemPrompt += `\n\n# TOOLS AVAILABLE\nYou have access to the following tools:\n${toolsJson}\n\n# TOOL CALLING FORMAT (MANDATORY)\nTo use a tool, you MUST output a JSON object wrapped EXACTLY in these tags:\n<tool_call>\n{"name": "tool_name", "arguments": {"param_name": "value"}}\n</tool_call>\n\nEXAMPLE OF MULTIPLE TOOL CALLS:\n<tool_call>\n{"name": "read_file", "arguments": {"path": "file1.txt"}}\n</tool_call>\n<tool_call>\n{"name": "read_file", "arguments": {"path": "file2.txt"}}\n</tool_call>\n\nCRITICAL RULES:\n1. ONLY use the tags above for tool calling. NEVER output raw JSON without tags.\n2. You can call multiple tools by outputting multiple <tool_call> blocks consecutively.\n3. Do NOT output any other text (explanations, chat, etc.) after your <tool_call> blocks. Wait for the user to provide the tool response.\n4. The JSON inside the tags MUST be valid and include ALL required braces and the "arguments" field.\n5. If you need to use a tool, do it IMMEDIATELY without preamble.\n\n`;
+        
+        if (bodyAny.tool_choice && typeof bodyAny.tool_choice === 'object' && bodyAny.tool_choice.function) {
+          const forcedTool = bodyAny.tool_choice.function.name;
+          systemPrompt += `CRITICAL: You MUST call the tool "${forcedTool}" in this response.\n\n`;
         }
-        if (msg.tool_calls && Array.isArray(msg.tool_calls)) {
-           for (const tc of msg.tool_calls) {
-              let args = tc.function?.arguments || '{}';
-              if (typeof args !== 'string') args = JSON.stringify(args);
-              assistantContent += `\n<tool_call>{"name": "${tc.function?.name}", "arguments": ${args}}</tool_call>`;
-           }
-        }
-        prompt += `Assistant: ${assistantContent.trim()}\n\n`;
-      } else if (msg.role === 'tool' || msg.role === 'function') {
-        prompt += `Tool Response (${msg.name || 'tool'}): ${contentStr}\n\n`;
-      }
-    }
-
-    // Inject tools instructions
-    const bodyAny = body as any;
-    if (bodyAny.tools && Array.isArray(bodyAny.tools) && bodyAny.tools.length > 0) {
-      // Better formatting for tools
-      const formattedTools = bodyAny.tools.map((t: any) => {
-        if (t.type === 'function') {
-          return {
-            name: t.function.name,
-            description: t.function.description || '',
-            parameters: t.function.parameters
-          };
-        }
-        return t;
-      });
-      const toolsJson = JSON.stringify(formattedTools, null, 2);
-      
-      systemPrompt += `\n\n# TOOLS AVAILABLE\nYou have access to the following tools:\n${toolsJson}\n\n# TOOL CALLING FORMAT (MANDATORY)\nTo use a tool, you MUST output a JSON object wrapped EXACTLY in these tags:\n<tool_call>\n{"name": "tool_name", "arguments": {"param_name": "value"}}\n</tool_call>\n\nEXAMPLE OF MULTIPLE TOOL CALLS:\n<tool_call>\n{"name": "read_file", "arguments": {"path": "file1.txt"}}\n</tool_call>\n<tool_call>\n{"name": "read_file", "arguments": {"path": "file2.txt"}}\n</tool_call>\n\nCRITICAL RULES:\n1. ONLY use the tags above for tool calling. NEVER output raw JSON without tags.\n2. You can call multiple tools by outputting multiple <tool_call> blocks consecutively.\n3. Do NOT output any other text (explanations, chat, etc.) after your <tool_call> blocks. Wait for the user to provide the tool response.\n4. The JSON inside the tags MUST be valid and include ALL required braces and the "arguments" field.\n5. If you need to use a tool, do it IMMEDIATELY without preamble.\n\n`;
-      
-      if (bodyAny.tool_choice && typeof bodyAny.tool_choice === 'object' && bodyAny.tool_choice.function) {
-        const forcedTool = bodyAny.tool_choice.function.name;
-        systemPrompt += `CRITICAL: You MUST call the tool "${forcedTool}" in this response.\n\n`;
       }
     }
 
     const finalPrompt = systemPrompt ? `${systemPrompt}\n${prompt}` : prompt;
 
     const isThinkingModel = body.model.includes('thinking');
-    const isNewSession = !messages.some(m => m.role === 'assistant');
 
     // Empty response retry logic
     let stream: ReadableStream;
@@ -244,7 +280,7 @@ export async function chatCompletions(c: Context) {
     let retries = 3;
     while (retries > 0) {
       try {
-        const result = await createKimiStream(finalPrompt, isThinkingModel, body.model, isNewSession ? null : undefined);
+        const result = await createKimiStream(finalPrompt, isThinkingModel, body.model, sessionAffinity);
         stream = result.stream;
         uiSessionId = result.uiSessionId;
         break; // Success
@@ -270,7 +306,7 @@ export async function chatCompletions(c: Context) {
       const MAX_AUTO_CONTINUE_TURNS = 5;
 
       while (autoContinueTurns < MAX_AUTO_CONTINUE_TURNS) {
-        const res = await consumeKimiStream(currentStream, toolParser, currentUiSessionId);
+        const res = await consumeKimiStream(currentStream, toolParser, currentUiSessionId, sessionAffinity);
         textBuffer += res.textBuffer;
         reasoningBuffer += res.reasoningBuffer;
         toolCallsOut.push(...res.toolCallsOut);
@@ -287,7 +323,7 @@ export async function chatCompletions(c: Context) {
           let nextStream: ReadableStream | null = null;
           while (retries > 0) {
             try {
-              const result = await createKimiStream('continue', isThinkingModel, body.model, undefined);
+              const result = await createKimiStream('continue', isThinkingModel, body.model, sessionAffinity);
               nextStream = result.stream;
               currentUiSessionId = result.uiSessionId;
               break;
@@ -393,7 +429,9 @@ export async function chatCompletions(c: Context) {
             if (msg.op === 'set' && msg.mask === 'message' && msg.message) {
               if (msg.message.role === 'assistant' && msg.message.id) {
                 assistantMessageId = msg.message.id;
-                updateSessionParent(currentUiSessionId, assistantMessageId);
+                if (sessionAffinity) {
+                  updateSession(sessionAffinity, currentUiSessionId, assistantMessageId);
+                }
               }
             }
 
@@ -499,7 +537,7 @@ export async function chatCompletions(c: Context) {
           let nextStream: ReadableStream | null = null;
           while (retries > 0) {
             try {
-              const result = await createKimiStream('continue', isThinkingModel, body.model, undefined);
+              const result = await createKimiStream('continue', isThinkingModel, body.model, sessionAffinity);
               nextStream = result.stream;
               currentUiSessionId = result.uiSessionId;
               break;
