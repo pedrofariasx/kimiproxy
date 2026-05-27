@@ -262,7 +262,6 @@ export async function chatCompletions(c: Context) {
     const finalPrompt = systemPrompt ? `${systemPrompt}\n${prompt}` : prompt;
 
     const isThinkingModel = body.model.includes('thinking');
-    const sessionAffinity = c.req.header('x-session-affinity') || null;
 
     // Empty response retry logic
     let stream: ReadableStream;
