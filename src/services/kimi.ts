@@ -7,13 +7,20 @@
 
 import { getKimiHeaders } from './playwright.ts';
 
-const sessionStates: Record<string, string | null> = (globalThis as any)._sessionStates || {};
-(globalThis as any)._sessionStates = sessionStates;
+interface SessionData {
+  kimiChatId: string;
+  parentMessageId: string | null;
+}
 
-export function updateSessionParent(sessionId: string, parentId: string | null) {
-  if (sessionId) {
-    sessionStates[sessionId] = parentId;
-  }
+const sessions = new Map<string, SessionData>();
+
+export function updateSession(sessionId: string, kimiChatId: string, parentMessageId: string | null) {
+  if (!sessionId || !kimiChatId) return;
+  sessions.set(sessionId, { kimiChatId, parentMessageId });
+}
+
+export function getSession(sessionId: string): SessionData | undefined {
+  return sessions.get(sessionId);
 }
 
 // Mapeia modelos recebidos do front para os cenários internos da Kimi
@@ -62,17 +69,27 @@ export async function createKimiStream(
   prompt: string,
   enableThinking: boolean,
   modelId: string,
-  forcedParentId?: string | null
+  sessionId?: string | null
 ): Promise<{ stream: ReadableStream, headers: Record<string, string>, uiSessionId: string }> {
-  const { headers, chatSessionId, parentMessageId } = await getKimiHeaders(forcedParentId === null);
+  let headers: Record<string, string>;
+  let activeChatId: string;
+  let parentMessageId: string | null = null;
 
-  let actualParentId: string | null = parentMessageId;
-  let activeChatId = chatSessionId;
-
-  if (forcedParentId !== undefined) {
-    actualParentId = forcedParentId;
-  } else if (activeChatId && sessionStates[activeChatId] !== undefined) {
-    actualParentId = sessionStates[activeChatId];
+  // Try to reuse existing session
+  const cachedSession = sessionId ? getSession(sessionId) : undefined;
+  
+  if (cachedSession) {
+    // OpenCode: reuse existing chat — use cached headers, inject saved chatId
+    const result = await getKimiHeaders(false);
+    headers = result.headers;
+    activeChatId = cachedSession.kimiChatId;
+    parentMessageId = cachedSession.parentMessageId;
+  } else {
+    // New session (or no sessionId): normal flow, Playwright handles it
+    const result = await getKimiHeaders(false);
+    headers = result.headers;
+    activeChatId = result.chatSessionId;
+    parentMessageId = result.parentMessageId;
   }
 
   const modelConfig = getModelScenario(modelId);
@@ -80,7 +97,7 @@ export async function createKimiStream(
   const payload: any = {
     scenario: modelConfig.scenario,
     message: {
-      parent_id: actualParentId || "",
+      parent_id: parentMessageId || "",
       role: 'user',
       blocks: [
         {

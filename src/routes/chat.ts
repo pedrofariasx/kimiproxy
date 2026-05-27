@@ -8,7 +8,7 @@
 import { Context } from 'hono';
 import { stream as honoStream } from 'hono/streaming';
 import { v4 as uuidv4 } from 'uuid';
-import { createKimiStream, updateSessionParent } from '../services/kimi.ts';
+import { createKimiStream, updateSession, getSession } from '../services/kimi.ts';
 import { OpenAIRequest } from '../utils/types.ts';
 import { StreamingToolParser } from '../tools/parser.ts';
 
@@ -88,12 +88,14 @@ interface StreamConsumptionResult {
   toolCallsOut: any[];
   assistantMessageId: string;
   uiSessionId: string;
+  sessionAffinity: string | null;
 }
 
 async function consumeKimiStream(
   stream: ReadableStream,
   toolParser: StreamingToolParser,
-  initialUiSessionId: string
+  initialUiSessionId: string,
+  sessionAffinity: string | null
 ): Promise<StreamConsumptionResult> {
   const reader = stream.getReader();
   const parser = new ConnectStreamParser();
@@ -116,7 +118,10 @@ async function consumeKimiStream(
       if (msg.op === 'set' && msg.mask === 'message' && msg.message) {
         if (msg.message.role === 'assistant' && msg.message.id) {
           assistantMessageId = msg.message.id;
-          updateSessionParent(uiSessionId, assistantMessageId);
+          // OpenCode: save session using x-session-affinity as key
+          if (sessionAffinity) {
+            updateSession(sessionAffinity, uiSessionId, assistantMessageId);
+          }
         }
       }
 
@@ -162,7 +167,8 @@ async function consumeKimiStream(
     reasoningBuffer,
     toolCallsOut,
     assistantMessageId,
-    uiSessionId
+    uiSessionId,
+    sessionAffinity
   };
 }
 
@@ -236,7 +242,7 @@ export async function chatCompletions(c: Context) {
     const finalPrompt = systemPrompt ? `${systemPrompt}\n${prompt}` : prompt;
 
     const isThinkingModel = body.model.includes('thinking');
-    const isNewSession = !messages.some(m => m.role === 'assistant');
+    const sessionAffinity = c.req.header('x-session-affinity') || null;
 
     // Empty response retry logic
     let stream: ReadableStream;
@@ -244,7 +250,7 @@ export async function chatCompletions(c: Context) {
     let retries = 3;
     while (retries > 0) {
       try {
-        const result = await createKimiStream(finalPrompt, isThinkingModel, body.model, isNewSession ? null : undefined);
+        const result = await createKimiStream(finalPrompt, isThinkingModel, body.model, sessionAffinity);
         stream = result.stream;
         uiSessionId = result.uiSessionId;
         break; // Success
@@ -270,7 +276,7 @@ export async function chatCompletions(c: Context) {
       const MAX_AUTO_CONTINUE_TURNS = 5;
 
       while (autoContinueTurns < MAX_AUTO_CONTINUE_TURNS) {
-        const res = await consumeKimiStream(currentStream, toolParser, currentUiSessionId);
+        const res = await consumeKimiStream(currentStream, toolParser, currentUiSessionId, sessionAffinity);
         textBuffer += res.textBuffer;
         reasoningBuffer += res.reasoningBuffer;
         toolCallsOut.push(...res.toolCallsOut);
@@ -393,7 +399,9 @@ export async function chatCompletions(c: Context) {
             if (msg.op === 'set' && msg.mask === 'message' && msg.message) {
               if (msg.message.role === 'assistant' && msg.message.id) {
                 assistantMessageId = msg.message.id;
-                updateSessionParent(currentUiSessionId, assistantMessageId);
+                if (sessionAffinity) {
+                  updateSession(sessionAffinity, currentUiSessionId, assistantMessageId);
+                }
               }
             }
 
