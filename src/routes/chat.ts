@@ -323,7 +323,7 @@ export async function chatCompletions(c: Context) {
           let nextStream: ReadableStream | null = null;
           while (retries > 0) {
             try {
-              const result = await createKimiStream('continue', isThinkingModel, body.model, undefined);
+              const result = await createKimiStream('continue', isThinkingModel, body.model, sessionAffinity);
               nextStream = result.stream;
               currentUiSessionId = result.uiSessionId;
               break;
@@ -537,7 +537,7 @@ export async function chatCompletions(c: Context) {
           let nextStream: ReadableStream | null = null;
           while (retries > 0) {
             try {
-              const result = await createKimiStream('continue', isThinkingModel, body.model, undefined);
+              const result = await createKimiStream('continue', isThinkingModel, body.model, sessionAffinity);
               nextStream = result.stream;
               currentUiSessionId = result.uiSessionId;
               break;
